@@ -1,3 +1,4 @@
+{-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE ImplicitParams #-}
@@ -8,37 +9,54 @@ module Unfold where
 import GHC.Core.Multiplicity
 import GHC.Core.Opt.Arity
 import GHC.Plugins
+import GHC.Types.Unique.DSet
+import qualified Data.List as List
 import qualified GHC.Utils.Outputable as Outputable
 
 -- | An expression with ordered free variables.
-data Goal = Goal
-  { goalFVs :: [Id],
-    goalBody :: CoreExpr
-  }
+data Goal k = 
+  Goal [Id] k
+  deriving stock Functor
 
-instance Outputable Goal where
+instance Outputable k => Outputable (Goal k) where
   ppr (Goal xs body) =
     forAllLit <+> pprWithCommas ppr xs Outputable.<> dot <+> ppr body
 
+-- | Free variables in a goal.
+goalFVs :: Goal k -> [Id]
+goalFVs (Goal xs _) = xs
+
 -- | Check if two goals are alpha equivalent.
-alphaEquiv :: (?scope :: InScopeSet) => Goal -> Goal -> Bool
+alphaEquiv :: (?scope :: InScopeSet) => Goal CoreExpr -> Goal CoreExpr -> Bool
 alphaEquiv (Goal xs body) (Goal xs' body') =
   let ?scope = extendInScopeSetList ?scope (xs ++ xs')
    in let subst = mkOpenSubst ?scope (zip xs' (map Var xs))
        in eqExpr ?scope body (substExpr subst body')
 
--- | A narrowing tree of congruence/case analyses.
+-- | A partial narrowing tree with at most one case analysis in each branch.
 data Narrowing m k
   = LitLeaf Literal
-  | CongNode DataCon [k]
+  | CongNode DataCon [Narrowing m k]
   | CaseNode
       CoreExpr
       -- ^ Simplified expression /before/ case analysis.
       Id
       -- ^ Scrutinee
-      [(DataCon, m (k, Subst))]
+      [(DataCon, m (Goal k, Subst))]
       -- ^ Case continuation
-  deriving stock (Functor)
+  deriving stock Functor
+
+-- | Reconstruct the goal before narrowing but after reduction.
+preNarrowing :: Narrowing m k -> CoreExpr
+preNarrowing (LitLeaf lit) = Lit lit
+preNarrowing (CongNode con conArgs) = mkConApp con (map preNarrowing conArgs)
+preNarrowing (CaseNode reduct _ _) = reduct
+
+-- | Collect sub-goals from a partial narrowing tree.
+subGoals :: Functor m => Narrowing m k -> [m (Goal k)]
+subGoals (LitLeaf _) = []
+subGoals (CongNode _ conArgs) = [ subGoal | conArg <- conArgs, subGoal <- subGoals conArg]
+subGoals (CaseNode _ _ cases) = [ fmap fst subgoal | (_, subgoal) <- cases]
 
 -- | Unfold a goal into a list of reachable goals.
 unfold ::
@@ -47,21 +65,30 @@ unfold ::
     ?defns :: IdEnv CoreExpr,
     ?scope :: InScopeSet
   ) =>
-  Goal ->
-  m [Goal]
+  Goal CoreExpr ->
+  m [Goal CoreExpr]
 unfold goal = loop [goal] []
   where
-    loop :: [Goal] -> [Goal] -> m [Goal]
+    loop :: [Goal CoreExpr] -> [Goal CoreExpr] -> m [Goal CoreExpr]
     loop [] seen = pure seen
-    loop (goal : goals) seen =
-      case narrow goal of
-        (pre, _)
-          | any (alphaEquiv pre) seen -> loop goals seen
-        (pre, LitLeaf lit) -> loop goals (pre : seen)
-        (pre, CongNode con goals') -> loop (goals' ++ goals) (pre : seen)
-        (pre, CaseNode _ x cases) -> do
-          goals' <- mapM (\(_, m) -> fst <$> m) cases
-          loop (goals' ++ goals) (pre : seen)
+    loop (goal : goals) seen = do
+      let narrowing = narrow goal
+          reduct = preNarrowing narrowing
+          goal' = Goal (goalFVs goal) reduct
+      pprTraceM "Goal:" (ppr goal')
+
+      if any (alphaEquiv goal') seen
+        then loop goals seen
+        else do
+          case List.find (\x -> not (x `elementOfUniqDSet` freeVarsOf (freeVars reduct))) (goalFVs goal) of
+            Nothing -> do
+              goals' <- sequence (subGoals narrowing)
+              loop (goals' ++ goals) (goal' : seen)
+            Just x -> do
+              let (tc, tcArgs) = splitTyConApp (idType x)
+                  narrowing' = CaseNode reduct x [(dc, expand goal' x dc tcArgs) | dc <- tyConDataCons tc]
+              goals' <- sequence (subGoals narrowing')
+              loop (goals' ++ goals) (goal' : seen)
 
 -- | Narrow a goal.
 narrow ::
@@ -70,23 +97,17 @@ narrow ::
     ?defns :: IdEnv CoreExpr,
     ?scope :: InScopeSet
   ) =>
-  Goal ->
-  (Goal, Narrowing m Goal)
+  Goal CoreExpr ->
+  Narrowing m CoreExpr
 narrow (Goal xs expr) =
   let ?scope = ?scope `extendInScopeSetList` xs
-   in prePost (reduce expr [])
+   in reduce expr []
   where
-    -- Rebuild the simplified goal and the result of narrowing.
-    prePost :: Narrowing m Goal -> (Goal, Narrowing m Goal)
-    prePost res@(LitLeaf lit) = (Goal xs (Lit lit), res)
-    prePost res@(CongNode con subgoals) = (Goal xs (mkConApp con (map goalBody subgoals)), res)
-    prePost res@(CaseNode pre _ _) = (Goal xs pre, res)
-
     -- Reduce an application, narrowing when appropriate.
-    reduce :: CoreExpr -> [CoreArg] -> Narrowing m Goal
+    reduce :: CoreExpr -> [CoreArg] -> Narrowing m CoreExpr
     reduce (Var x) args
       | Just con <- isDataConId_maybe x = do
-          CongNode con [Goal xs arg | arg <- args]
+          CongNode con [ reduce arg [] | arg <- args, isValArg arg]
       | x `elem` xs = do
           let (tc, tcArgs) = splitTyConApp (idType x)
               goal = Goal xs (mkApps (Var x) args)
@@ -113,10 +134,9 @@ narrow (Goal xs expr) =
         LitLeaf lit
           | Just (Alt _ _ rhs) <- findAlt (LitAlt lit) alts -> reduce rhs args
           | otherwise -> pprPanic "Case expression is non-exhaustive!" (ppr expr)
-        CongNode con subgoals
+        CongNode con (map preNarrowing -> conArgs)
           | Just (Alt _ patVars rhs) <- findAlt (DataAlt con) alts -> do
-              let conArgs = map goalBody subgoals
-                  subst = mkOpenSubst ?scope ((x, mkConApp con conArgs) : zip patVars conArgs)
+              let subst = mkOpenSubst ?scope ((x, mkConApp con conArgs) : zip patVars conArgs)
                in reduce (substExpr subst rhs) args
           | otherwise -> pprPanic "Case expression is non-exhaustive!" (ppr expr)
         CaseNode scrut' y cases ->
@@ -138,13 +158,13 @@ narrow (Goal xs expr) =
         Just (args', MRefl) ->
           reduce expr' args'
         Just (args', MCo g') -> do
-          (\(Goal ys res) -> Goal ys (Cast res g')) <$> reduce expr' args'
+          (`Cast` g') <$> reduce expr' args'
     reduce (Tick t expr) args = reduce expr args
     reduce (Type ty) args = pprPanic "Cannot narrow type!" (ppr ty)
     reduce (Coercion g) args = pprPanic "Cannot narrow coercion!" (ppr g)
 
 -- | Expand the variable to a fresh instances of the constructor in the goal.
-expand :: forall m. (MonadUnique m, ?scope :: InScopeSet) => Goal -> Id -> DataCon -> [Type] -> m (Goal, Subst)
+expand :: forall m. (MonadUnique m, ?scope :: InScopeSet) => Goal CoreExpr -> Id -> DataCon -> [Type] -> m (Goal CoreExpr, Subst)
 expand goal@(Goal xs expr) x con tyargs = do
   us <- mapM freshId (dataConInstArgTys con tyargs)
   let subst = mkOpenSubst ?scope [(x, mkConApp con (map Var us))]

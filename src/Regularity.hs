@@ -11,6 +11,7 @@ import Data.Data
 import GHC.Plugins
 import Unfold
 
+-- | Annotates regular definitions.
 data Regular
   = Regular
   deriving stock (Data)
