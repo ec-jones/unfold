@@ -1,0 +1,44 @@
+cabal-version:          3.0
+name:                   regularity
+version:                0.1.0.0
+license:                MIT
+license-file:           LICENSE
+category:               Verification
+
+library
+    exposed-modules:    Regularity
+
+    other-modules:      Unfold
+
+    hs-source-dirs:     src
+
+    build-depends:      base,
+                        mtl,
+                        ghc
+
+    ghc-options:        -Wall
+                        -Wcompat
+                        -Widentities
+                        -Wincomplete-uni-patterns
+                        -Wincomplete-record-updates
+                        -Wredundant-constraints
+                        -Wmissing-export-lists
+                        -Wpartial-fields
+                        -Wmissing-deriving-strategies
+                        -Wunused-packages
+
+                        -Wno-unused-matches
+                        -Wno-name-shadowing
+
+    default-language:   Haskell2010
+
+library test
+  exposed-modules:    Test
+
+  hs-source-dirs:     test
+
+  build-depends:      base, regularity
+
+  ghc-options:        -fplugin Regularity
+
+  default-language:   Haskell2010
